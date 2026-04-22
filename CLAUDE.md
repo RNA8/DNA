@@ -1,103 +1,153 @@
 # CLAUDE.md — DNA (Deep Neural Acceleration)
 
-This file documents the repository structure, conventions, and development workflow for AI assistants (and human contributors) working on this codebase.
+Lightweight INT8 Vision Transformer inference library in C, targeting
+Raspberry Pi 4 / 5 (ARM Cortex-A72 / A76).  Loads quantized `.tflite`
+models and runs them using NEON SIMD with runtime dispatch for the
+ARMv8.2-A dot-product extension.
+
+License: GNU GPL v3
 
 ---
 
-## Project Overview
-
-| Field   | Value                        |
-|---------|------------------------------|
-| Name    | DNA — Deep Neural Acceleration |
-| License | GNU General Public License v3 |
-| Status  | Skeleton — no source code yet |
-
-The project name suggests a focus on accelerating deep neural network workloads, but no implementation exists as of this writing. Do not assume or hallucinate existing code paths, APIs, or dependencies.
-
----
-
-## Current Repository Contents
+## Repository Layout
 
 ```
 DNA/
-├── CLAUDE.md      # This file
-├── LICENSE        # GNU GPL v3
-└── README.md      # Two-line stub (title + tagline)
-```
-
-No source code, tests, build scripts, dependencies, or CI/CD pipelines have been added yet.
-
----
-
-## Expected Future Structure
-
-When implementation begins, follow this conventional layout (adjust to match the chosen tech stack):
-
-```
-DNA/
-├── src/           # Primary source code
-├── tests/         # Unit and integration tests
-├── docs/          # Extended documentation
-├── scripts/       # Utility / automation scripts
-├── .github/
-│   └── workflows/ # CI/CD pipelines
-├── CLAUDE.md
-├── LICENSE
+├── include/
+│   └── dna.h              Public API (load, invoke, tensor accessors)
+├── src/
+│   ├── fb.h               Header-only FlatBuffers binary reader
+│   ├── tflite_schema.h    TFLite op codes, tensor types, field indices
+│   ├── model.h            Internal IR: Tensor, Op, DnaModel structs
+│   ├── model.c            TFLite flatbuffer parser + mmap loader
+│   ├── ops.h              Internal op function declarations
+│   ├── runner.c           Graph executor (dispatch loop over ops)
+│   └── ops/
+│       ├── gemm.c         INT8 FULLY_CONNECTED — NEON baseline + dotprod
+│       ├── batchmatmul.c  INT8 BATCH_MATMUL (attention scores/context)
+│       ├── softmax.c      SOFTMAX (dequant → float → requant)
+│       ├── layernorm.c    LAYER_NORM (float normalization)
+│       ├── gelu.c         GELU via 256-entry INT8 lookup table
+│       ├── conv2d.c       CONV_2D (patch embedding, scalar)
+│       └── elemwise.c     ADD, MUL, MEAN, RESHAPE, TRANSPOSE,
+│                          QUANTIZE, DEQUANTIZE
+├── Makefile
+├── LICENSE                GNU GPL v3
 └── README.md
 ```
 
-Update this section and the rest of CLAUDE.md as the actual structure solidifies.
+---
+
+## Build
+
+```bash
+make              # builds libdna.a
+make clean
+```
+
+Compiler flags on aarch64: `-O3 -march=armv8-a+simd`.  The dotprod
+kernel in `gemm.c` uses `__attribute__((target("+dotprod")))` and is
+selected at runtime via `HWCAP_ASIMDDP`.  The library compiles and runs
+on x86 (scalar fallback) for development.
+
+---
+
+## Public API (`include/dna.h`)
+
+```c
+DnaModel  *dna_load(const char *path);   // mmap + parse .tflite
+void       dna_free(DnaModel *m);
+
+int        dna_n_inputs(const DnaModel *m);
+int        dna_n_outputs(const DnaModel *m);
+DnaTensor *dna_input(DnaModel *m, int idx);   // write INT8 data here
+DnaTensor *dna_output(DnaModel *m, int idx);  // read INT8 data here
+
+int        dna_invoke(DnaModel *m);           // returns DNA_OK or error
+
+// DnaTensor fields: data (int8_t*), shape[], ndim, scale, zero_point
+// Quantize:    q = clamp(round(x / scale) + zero_point, -128, 127)
+// Dequantize:  x = (q - zero_point) * scale
+```
+
+---
+
+## Supported TFLite Ops
+
+| Op | TFLite code | Notes |
+|---|---|---|
+| FULLY_CONNECTED | 9 | INT8 GEMM, per-channel weights, fused ReLU/ReLU6 |
+| BATCH_MATMUL | 126 | Attention scores (Q×Kᵀ) and context (Attn×V) |
+| SOFTMAX | 25 | Float computation over last dim |
+| LAYER_NORM | 149 | Float normalization; also handles decomposed sequences |
+| GELU | 137 | 256-entry LUT |
+| CONV_2D | 3 | Patch embedding, VALID/SAME padding |
+| ADD | 0 | Residual connections |
+| MUL | 18 | |
+| MEAN | 40 | Global average pool |
+| RESHAPE | 22 | |
+| TRANSPOSE | 39 | |
+| QUANTIZE | 114 | float → INT8 |
+| DEQUANTIZE | 6 | INT8 → float |
+| RELU / RELU6 | 19, 24 | In-place |
+
+---
+
+## Quantization Model
+
+- **Weights**: INT8, symmetric per-channel (`scale[c]`, `zero_point[c]=0`)
+- **Activations**: INT8, asymmetric per-tensor (`scale`, `zero_point`)
+- **Bias**: INT32, scale = `s_activation × s_weight[c]`
+- **Accumulation**: INT32, then requantized via `round(acc × s_eff) + zp_out`
+- **Target training**: PyTorch QAT → `ai_edge_torch` → `.tflite`
+
+---
+
+## NEON Strategy
+
+| CPU | ISA | Instruction | Throughput |
+|---|---|---|---|
+| Cortex-A72 (Pi 4) | ARMv8.0-A | `vmull_s8` + `vpadalq_s16` | 8 MACs/cycle |
+| Cortex-A76 (Pi 5) | ARMv8.2-A+dotprod | `vdotq_s32` | 16 MACs/cycle† |
+
+†Per NEON lane; 4 lanes → 64 INT8 MACs per `vdotq_s32` instruction.
+
+Runtime detection in `gemm.c`:
+```c
+getauxval(AT_HWCAP) & HWCAP_ASIMDDP  →  select dotprod path
+```
+
+---
+
+## Adding a New Op
+
+1. Add the TFLite opcode to `TflOpCode` in `src/tflite_schema.h`
+2. Add a `params` field in the op union in `src/model.h` if needed
+3. Parse the op options in `parse_op()` in `src/model.c`
+4. Implement `int op_foo(DnaModel *m, const Op *op)` in `src/ops/`
+5. Declare it in `src/ops.h`
+6. Add a `case TFL_OP_FOO:` in the dispatch in `src/runner.c`
+7. Update this file
+
+---
+
+## Known Limitations / Future Work
+
+- `BATCH_MATMUL` uses a scalar inner loop when B (keys) is column-strided;
+  a transposed-B packing pass would vectorize this fully
+- `MEAN` uses an O(output × input) fallback; replace with a proper
+  strided-reduction once axes are always the spatial dims [1,2]
+- `CONV_2D` is scalar; patch embedding is called once per inference so
+  this is not a bottleneck, but a NEON im2col+GEMM path would help for
+  multi-scale conv stems (MobileViT)
+- No multi-threading; the graph is single-threaded
+- No memory re-use across activations (scratch = sum of all activation sizes)
 
 ---
 
 ## Development Workflow
 
-### Branches
-
-- **`master`** — stable, production-ready commits only
-- **Feature branches** — named `<namespace>/<short-description>-<id>` (e.g. `claude/add-claude-documentation-Cj2cU`)
-- Never commit directly to `master` without review
-
-### Commits
-
-- Write short, imperative commit messages: `Add training loop`, `Fix memory leak in loader`
-- Keep commits focused; one logical change per commit
-- Reference issue numbers when applicable: `Fix gradient overflow (#42)`
-
-### Build & Test
-
-No build system or test framework is configured yet. When one is established:
-
-1. Add run commands here (e.g. `make build`, `pytest`, `cargo test`)
-2. Document required environment variables or secrets
-3. Note any pre-commit hooks or linting requirements
-
----
-
-## Key Conventions for AI Assistants
-
-- **No code exists yet.** Do not reference, import, or depend on files that are not present in the repository. Verify with `ls` or `find` before assuming a file exists.
-- **License compliance.** All contributed code must be compatible with GNU GPL v3. Avoid copying code from permissively-licensed sources without confirming GPL compatibility.
-- **Keep CLAUDE.md current.** Whenever significant new patterns, dependencies, or conventions are introduced (new framework, test runner, env vars, etc.), update the relevant section of this file in the same commit.
-- **Prefer editing existing files** over creating new ones when adding small changes.
-- **No speculative abstractions.** Implement only what is explicitly requested; do not add helper utilities, wrapper classes, or future-proofing code unless asked.
-
----
-
-## Testing
-
-No test framework has been configured. When tests are added:
-
-- Document the framework and how to run the suite here
-- Place tests under `tests/` mirroring the source structure
-- Aim for unit tests on core logic and integration tests on I/O boundaries
-
----
-
-## CI/CD
-
-No CI/CD pipelines exist yet. When added, document:
-
-- Pipeline trigger conditions (push, PR, schedule)
-- Required secrets or environment variables
-- How to reproduce a CI failure locally
+- Branch: `claude/<feature>-<id>` off `master`
+- Commits: short imperative messages
+- Build check: `make` must succeed before pushing
+- No external dependencies beyond libc and libm
