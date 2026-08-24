@@ -1,4 +1,8 @@
-# CLAUDE.md — DNA (Deep Neural Acceleration)
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## DNA (Deep Neural Acceleration)
 
 Lightweight INT8 Vision Transformer inference library in C, targeting
 Raspberry Pi 4 / 5 (ARM Cortex-A72 / A76).  Loads quantized `.tflite`
@@ -50,6 +54,11 @@ kernel in `gemm.c` uses `__attribute__((target("+dotprod")))` and is
 selected at runtime via `HWCAP_ASIMDDP`.  The library compiles and runs
 on x86 (scalar fallback) for development.
 
+There is no test suite and no `main()`/example binary in the repo — `libdna.a`
+is a library only. Validate changes by confirming `make` succeeds on both
+x86 (scalar path) and aarch64 (NEON path) and by manually checking the
+quantization arithmetic against the formulas in this file.
+
 ---
 
 ## Public API (`include/dna.h`)
@@ -64,6 +73,9 @@ DnaTensor *dna_input(DnaModel *m, int idx);   // write INT8 data here
 DnaTensor *dna_output(DnaModel *m, int idx);  // read INT8 data here
 
 int        dna_invoke(DnaModel *m);           // returns DNA_OK or error
+
+int        dna_last_error(void);
+const char *dna_strerror(int err);
 
 // DnaTensor fields: data (int8_t*), shape[], ndim, scale, zero_point
 // Quantize:    q = clamp(round(x / scale) + zero_point, -128, 127)
